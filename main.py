@@ -7,8 +7,11 @@ import io
 import os
 import re
 import uuid
+import sqlite3
+import json
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,7 +29,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 # APP SETUP
 # =========================
 
-app = FastAPI(title="Competitor Intelligence Engine", version="1.1.0")
+app = FastAPI(title="Competitor Intelligence Engine", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -37,15 +40,185 @@ app.add_middleware(
 )
 
 # =========================
-# IN-MEMORY DATABASE
+# SQLITE DATABASE SETUP
 # =========================
 
-JOBS: Dict[str, Dict[str, Any]] = {}
-JOBS_LOCK = asyncio.Lock()
+DB_PATH = "jobs.db"
 
-# Store generated reports in memory (job_id -> {"pdf": bytes, "csv": str})
-REPORTS: Dict[str, Dict[str, Any]] = {}
-REPORTS_LOCK = asyncio.Lock()
+def init_database():
+    """Initialize SQLite database with jobs and reports tables"""
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS jobs (
+        job_id TEXT PRIMARY KEY,
+        status TEXT,
+        created_at TEXT,
+        completed_at TEXT,
+        progress INTEGER DEFAULT 0,
+        order_data TEXT,
+        result TEXT,
+        error TEXT
+    )
+    """)
+    
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS reports (
+        job_id TEXT PRIMARY KEY,
+        pdf_data BLOB,
+        csv_data TEXT,
+        FOREIGN KEY (job_id) REFERENCES jobs(job_id)
+    )
+    """)
+    
+    conn.commit()
+    conn.close()
+    print(f"Database initialized: {DB_PATH}")
+
+init_database()
+
+def get_db_connection():
+    """Get a database connection"""
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+# =========================
+# DATABASE OPERATIONS
+# =========================
+
+def db_create_job(job_id: str, order: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a new job in the database"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    created_at = datetime.utcnow().isoformat()
+    
+    cursor.execute("""
+    INSERT INTO jobs (job_id, status, created_at, progress, order_data)
+    VALUES (?, ?, ?, ?, ?)
+    """, (job_id, "queued", created_at, 0, json.dumps(order)))
+    
+    conn.commit()
+    conn.close()
+    
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "created_at": created_at,
+        "completed_at": None,
+        "progress_percent": 0,
+        "order": order,
+        "result": None,
+        "error": None
+    }
+
+def db_get_job(job_id: str) -> Optional[Dict[str, Any]]:
+    """Get a job from the database"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+    SELECT job_id, status, created_at, completed_at, progress, order_data, result, error
+    FROM jobs WHERE job_id = ?
+    """, (job_id,))
+    
+    row = cursor.fetchone()
+    conn.close()
+    
+    if not row:
+        return None
+    
+    return {
+        "job_id": row[0],
+        "status": row[1],
+        "created_at": row[2],
+        "completed_at": row[3],
+        "progress_percent": row[4] or 0,
+        "order": json.loads(row[5]) if row[5] else None,
+        "result": json.loads(row[6]) if row[6] else None,
+        "error": row[7]
+    }
+
+def db_update_job(job_id: str, **updates):
+    """Update a job in the database"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    field_map = {
+        "status": "status",
+        "completed_at": "completed_at",
+        "progress_percent": "progress",
+        "result": "result",
+        "error": "error"
+    }
+    
+    for key, value in updates.items():
+        if key in field_map:
+            db_field = field_map[key]
+            if key == "result" and value is not None:
+                value = json.dumps(value)
+            cursor.execute(f"UPDATE jobs SET {db_field} = ? WHERE job_id = ?", (value, job_id))
+    
+    conn.commit()
+    conn.close()
+
+def db_get_all_jobs() -> List[Dict[str, Any]]:
+    """Get all jobs from the database"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+    SELECT job_id, status, created_at, completed_at, progress, order_data, result, error
+    FROM jobs ORDER BY created_at DESC
+    """)
+    
+    rows = cursor.fetchall()
+    conn.close()
+    
+    jobs = []
+    for row in rows:
+        jobs.append({
+            "job_id": row[0],
+            "status": row[1],
+            "created_at": row[2],
+            "completed_at": row[3],
+            "progress_percent": row[4] or 0,
+            "order": json.loads(row[5]) if row[5] else None,
+            "result": json.loads(row[6]) if row[6] else None,
+            "error": row[7]
+        })
+    
+    return jobs
+
+def db_save_report(job_id: str, pdf_data: bytes, csv_data: str):
+    """Save report data to database"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+    INSERT OR REPLACE INTO reports (job_id, pdf_data, csv_data)
+    VALUES (?, ?, ?)
+    """, (job_id, pdf_data, csv_data))
+    
+    conn.commit()
+    conn.close()
+
+def db_get_report(job_id: str) -> Optional[Dict[str, Any]]:
+    """Get report data from database"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT pdf_data, csv_data FROM reports WHERE job_id = ?", (job_id,))
+    row = cursor.fetchone()
+    conn.close()
+    
+    if not row:
+        return None
+    
+    return {"pdf": row[0], "csv": row[1]}
+
+# In-memory cache for active jobs (faster access during processing)
+JOBS_CACHE: Dict[str, Dict[str, Any]] = {}
+JOBS_LOCK = asyncio.Lock()
 
 # Concurrency limits (protects from rate-limits & resource spikes)
 MAX_CONCURRENT_JOBS = 2
@@ -58,7 +231,7 @@ BIZ_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_BUSINESS_ANALYSIS)
 HTTP_CLIENT: Optional[httpx.AsyncClient] = None
 
 DEFAULT_HEADERS = {
-    "User-Agent": "CompetitorIntelBot/1.1 (contact: support@yoursite.com)",
+    "User-Agent": "CompetitorIntelBot/1.2 (contact: support@yoursite.com)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
@@ -90,16 +263,22 @@ def utcnow_iso() -> str:
     return datetime.utcnow().isoformat()
 
 async def set_job(job_id: str, **updates):
+    """Update job in both cache and database"""
     async with JOBS_LOCK:
-        if job_id not in JOBS:
-            return
-        JOBS[job_id].update(updates)
+        if job_id in JOBS_CACHE:
+            JOBS_CACHE[job_id].update(updates)
+    db_update_job(job_id, **updates)
 
 async def get_job(job_id: str) -> Dict[str, Any]:
+    """Get job from cache or database"""
     async with JOBS_LOCK:
-        if job_id not in JOBS:
-            raise HTTPException(status_code=404, detail="Job not found")
-        return JOBS[job_id].copy()
+        if job_id in JOBS_CACHE:
+            return JOBS_CACHE[job_id].copy()
+    
+    job = db_get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
 
 async def safe_progress(job_id: str, pct: int, status: Optional[str] = None):
     pct = max(0, min(100, int(pct)))
@@ -129,20 +308,15 @@ async def retry_async(fn, *args, tries=3, base_delay=0.6, **kwargs):
 async def start_analysis(order: OrderRequest):
     job_id = str(uuid.uuid4())
 
+    # Create job in database
+    job_data = db_create_job(job_id, order.dict())
+    
+    # Cache for fast access during processing
     async with JOBS_LOCK:
-        JOBS[job_id] = {
-            "job_id": job_id,
-            "status": "queued",
-            "created_at": utcnow_iso(),
-            "completed_at": None,
-            "progress_percent": 0,
-            "order": order.dict(),
-            "result": None,
-            "error": None,
-        }
+        JOBS_CACHE[job_id] = job_data.copy()
 
     asyncio.create_task(run_job_safe(job_id))
-    return JobStatus(**(await get_job(job_id)))
+    return JobStatus(**job_data)
 
 
 @app.get("/jobs/{job_id}", response_model=JobStatus)
@@ -152,13 +326,12 @@ async def get_job_status(job_id: str):
 
 @app.get("/jobs/{job_id}/pdf")
 async def download_pdf(job_id: str):
-    async with REPORTS_LOCK:
-        if job_id not in REPORTS or "pdf" not in REPORTS[job_id]:
-            raise HTTPException(status_code=404, detail="PDF report not found")
-        pdf_bytes = REPORTS[job_id]["pdf"]
+    report = db_get_report(job_id)
+    if not report or not report.get("pdf"):
+        raise HTTPException(status_code=404, detail="PDF report not found")
     
     return Response(
-        content=pdf_bytes,
+        content=report["pdf"],
         media_type="application/pdf",
         headers={"Content-Disposition": f"attachment; filename=competitor_report_{job_id[:8]}.pdf"}
     )
@@ -166,13 +339,12 @@ async def download_pdf(job_id: str):
 
 @app.get("/jobs/{job_id}/csv")
 async def download_csv(job_id: str):
-    async with REPORTS_LOCK:
-        if job_id not in REPORTS or "csv" not in REPORTS[job_id]:
-            raise HTTPException(status_code=404, detail="CSV report not found")
-        csv_content = REPORTS[job_id]["csv"]
+    report = db_get_report(job_id)
+    if not report or not report.get("csv"):
+        raise HTTPException(status_code=404, detail="CSV report not found")
     
     return Response(
-        content=csv_content,
+        content=report["csv"],
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename=competitor_report_{job_id[:8]}.csv"}
     )
@@ -180,29 +352,51 @@ async def download_csv(job_id: str):
 
 @app.get("/health")
 async def health_check():
-    async with JOBS_LOCK:
-        running = len([j for j in JOBS.values() if j["status"] == "running"])
-        queued = len([j for j in JOBS.values() if j["status"] == "queued"])
+    all_jobs = db_get_all_jobs()
+    running = len([j for j in all_jobs if j["status"] == "running"])
+    queued = len([j for j in all_jobs if j["status"] == "queued"])
+    completed = len([j for j in all_jobs if j["status"] == "completed"])
     return {
         "status": "healthy",
         "timestamp": utcnow_iso(),
+        "storage": "sqlite",
+        "total_jobs": len(all_jobs),
         "running_jobs": running,
-        "queued_jobs": queued
+        "queued_jobs": queued,
+        "completed_jobs": completed
+    }
+
+
+@app.get("/jobs")
+async def list_jobs():
+    """List all jobs"""
+    all_jobs = db_get_all_jobs()
+    return {
+        "total": len(all_jobs),
+        "jobs": all_jobs
     }
 
 
 @app.get("/")
 async def root():
+    all_jobs = db_get_all_jobs()
     return {
         "name": "Competitor Intelligence Engine",
-        "version": "1.1.0",
+        "version": "1.2.0",
+        "storage": "sqlite (persistent)",
         "endpoints": {
             "start_analysis": "POST /start-analysis",
             "job_status": "GET /jobs/{job_id}",
+            "list_jobs": "GET /jobs",
             "download_pdf": "GET /jobs/{job_id}/pdf",
             "download_csv": "GET /jobs/{job_id}/csv",
             "health": "GET /health",
             "docs": "GET /docs"
+        },
+        "stats": {
+            "total_jobs": len(all_jobs),
+            "completed": len([j for j in all_jobs if j["status"] == "completed"]),
+            "running": len([j for j in all_jobs if j["status"] == "running"])
         }
     }
 
@@ -641,12 +835,8 @@ async def generate_reports(job_id: str, businesses: List[Dict[str, Any]], summar
     # Generate CSV
     csv_content = generate_csv_report(businesses)
     
-    # Store in memory
-    async with REPORTS_LOCK:
-        REPORTS[job_id] = {
-            "pdf": pdf_bytes,
-            "csv": csv_content
-        }
+    # Store in database for persistence
+    db_save_report(job_id, pdf_bytes, csv_content)
     
     # Return download URLs
     pdf_url = f"/jobs/{job_id}/pdf"

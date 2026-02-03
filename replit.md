@@ -8,7 +8,7 @@ A FastAPI-based competitor intelligence engine that scrapes, analyzes, and gener
 
 The application is fully functional with:
 - Async job queue with progress tracking
-- In-memory job storage (upgrade to PostgreSQL for production)
+- **SQLite persistent storage** - Jobs and reports survive server restarts
 - PDF and CSV report generation
 - Rule-based market summary and scoring
 
@@ -17,6 +17,7 @@ The application is fully functional with:
 ```
 /
 ├── main.py              # Complete FastAPI application (single-file MVP)
+├── jobs.db              # SQLite database (persistent job/report storage)
 ├── pyproject.toml       # Python dependencies
 ├── uv.lock             # Dependency lock file
 └── replit.md           # This documentation
@@ -42,6 +43,7 @@ The application is fully functional with:
 | GET | `/docs` | Interactive Swagger documentation |
 | GET | `/health` | Health check with job queue status |
 | POST | `/start-analysis` | Start a new competitor analysis job |
+| GET | `/jobs` | List all jobs |
 | GET | `/jobs/{job_id}` | Get job status and results |
 | GET | `/jobs/{job_id}/pdf` | Download PDF report |
 | GET | `/jobs/{job_id}/csv` | Download CSV report |
@@ -96,7 +98,7 @@ The following environment variables/constants can be adjusted in `main.py`:
 ## Future Enhancements
 
 1. Integrate SerpAPI/Outscraper for real Google Maps data
-2. Add PostgreSQL database for persistent job storage
+2. Upgrade to PostgreSQL for production-scale persistence
 3. Implement email service (SendGrid/Resend) for notifications
 4. Create web UI dashboard for job submission
 5. Add webhook support for real-time status updates
