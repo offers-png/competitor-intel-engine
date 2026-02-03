@@ -1,0 +1,590 @@
+# main.py
+# Competitor Intelligence Engine - Strong Single-File MVP (Replit-ready)
+
+import asyncio
+import uuid
+from datetime import datetime
+from typing import List, Dict, Any, Optional, Tuple
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, EmailStr, Field
+import httpx
+
+# =========================
+# APP SETUP
+# =========================
+
+app = FastAPI(title="Competitor Intelligence Engine", version="1.1.0")
+
+# =========================
+# IN-MEMORY DATABASE (Replace with Supabase/Postgres later)
+# =========================
+
+JOBS: Dict[str, Dict[str, Any]] = {}
+JOBS_LOCK = asyncio.Lock()
+
+# Concurrency limits (protects you from rate-limits & Replit resource spikes)
+MAX_CONCURRENT_JOBS = 2
+MAX_CONCURRENT_BUSINESS_ANALYSIS = 8
+
+JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+BIZ_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_BUSINESS_ANALYSIS)
+
+# Shared HTTP client (faster + safer than creating per-request)
+HTTP_CLIENT: Optional[httpx.AsyncClient] = None
+
+DEFAULT_HEADERS = {
+    "User-Agent": "CompetitorIntelBot/1.1 (contact: support@yoursite.com)",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+# =========================
+# MODELS
+# =========================
+
+class OrderRequest(BaseModel):
+    email: EmailStr
+    business_name: str = Field(min_length=1, max_length=120)
+    industry: str = Field(min_length=2, max_length=50)   # plumber | painter | electrician | hvac | roofer
+    location: str = Field(min_length=2, max_length=120)  # zip or city
+    radius_miles: int = Field(default=10, ge=1, le=50)
+
+class JobStatus(BaseModel):
+    job_id: str
+    status: str  # queued | running | completed | failed
+    created_at: str
+    completed_at: Optional[str] = None
+    progress_percent: int = 0
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+# =========================
+# HELPERS
+# =========================
+
+def utcnow_iso() -> str:
+    return datetime.utcnow().isoformat()
+
+async def set_job(job_id: str, **updates):
+    async with JOBS_LOCK:
+        if job_id not in JOBS:
+            return
+        JOBS[job_id].update(updates)
+
+async def get_job(job_id: str) -> Dict[str, Any]:
+    async with JOBS_LOCK:
+        if job_id not in JOBS:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return JOBS[job_id]
+
+async def safe_progress(job_id: str, pct: int, status: Optional[str] = None):
+    pct = max(0, min(100, int(pct)))
+    updates = {"progress_percent": pct}
+    if status:
+        updates["status"] = status
+    await set_job(job_id, **updates)
+
+async def retry_async(fn, *args, tries=3, base_delay=0.6, **kwargs):
+    """
+    Simple retry with exponential backoff.
+    Use for flaky network operations.
+    """
+    last_exc = None
+    for i in range(tries):
+        try:
+            return await fn(*args, **kwargs)
+        except Exception as e:
+            last_exc = e
+            await asyncio.sleep(base_delay * (2 ** i))
+    raise last_exc
+
+# =========================
+# API ENDPOINTS
+# =========================
+
+@app.post("/start-analysis", response_model=JobStatus)
+async def start_analysis(order: OrderRequest):
+    job_id = str(uuid.uuid4())
+
+    async with JOBS_LOCK:
+        JOBS[job_id] = {
+            "job_id": job_id,
+            "status": "queued",
+            "created_at": utcnow_iso(),
+            "completed_at": None,
+            "progress_percent": 0,
+            "order": order.dict(),
+            "result": None,
+            "error": None,
+        }
+
+    # ✅ Strong fix: schedule async job with create_task (not BackgroundTasks)
+    asyncio.create_task(run_job_safe(job_id))
+
+    return JobStatus(**(await get_job(job_id)))
+
+
+@app.get("/jobs/{job_id}", response_model=JobStatus)
+async def get_job_status(job_id: str):
+    return JobStatus(**(await get_job(job_id)))
+
+
+@app.get("/health")
+async def health_check():
+    async with JOBS_LOCK:
+        running = len([j for j in JOBS.values() if j["status"] == "running"])
+        queued = len([j for j in JOBS.values() if j["status"] == "queued"])
+    return {
+        "status": "healthy",
+        "timestamp": utcnow_iso(),
+        "running_jobs": running,
+        "queued_jobs": queued
+    }
+
+# =========================
+# JOB RUNNER WITH ERROR HANDLING
+# =========================
+
+async def run_job_safe(job_id: str):
+    async with JOB_SEMAPHORE:
+        try:
+            await run_job(job_id)
+        except Exception as e:
+            await set_job(
+                job_id,
+                status="failed",
+                error=str(e),
+                completed_at=utcnow_iso(),
+                progress_percent=100
+            )
+            print(f"❌ Job {job_id} failed: {e}")
+
+
+async def run_job(job_id: str):
+    job = await get_job(job_id)
+    order = job["order"]
+
+    await safe_progress(job_id, 1, status="running")
+
+    # STEP 1: Scrape Google Maps (10%)
+    await safe_progress(job_id, 10)
+    businesses = await scrape_google_maps(order["industry"], order["location"], order["radius_miles"])
+
+    if not businesses:
+        raise ValueError("No competitors found in this location")
+
+    # STEP 2: Analyze competitors in parallel (20% -> 65%)
+    await safe_progress(job_id, 20)
+
+    analyzed: List[Dict[str, Any]] = []
+
+    async def analyze_business_guarded(b: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        async with BIZ_SEMAPHORE:
+            try:
+                return await analyze_business(b)
+            except Exception as e:
+                # don't kill whole job if one business fails
+                print(f"⚠️ Business analysis failed for {b.get('name')}: {e}")
+                return None
+
+    tasks = [asyncio.create_task(analyze_business_guarded(b)) for b in businesses]
+    total = len(tasks)
+
+    for idx, t in enumerate(asyncio.as_completed(tasks), start=1):
+        result = await t
+        if result:
+            analyzed.append(result)
+        # progress update (20..65)
+        pct = 20 + int((idx / total) * 45)
+        await safe_progress(job_id, pct)
+
+    if not analyzed:
+        raise ValueError("All competitor analyses failed (network/rate limits). Try again later.")
+
+    # STEP 3: Score & sort (65% -> 75%)
+    await safe_progress(job_id, 65)
+    for b in analyzed:
+        b["score"] = calculate_score(b)
+    analyzed.sort(key=lambda x: x.get("score", 0), reverse=True)
+    await safe_progress(job_id, 75)
+
+    # STEP 4: Market summary (75% -> 85%)
+    summary = generate_market_summary(analyzed)
+    await safe_progress(job_id, 85)
+
+    # STEP 5: Generate outputs (85% -> 95%)
+    pdf_url, csv_url = await generate_reports(job_id, analyzed, summary)
+    await safe_progress(job_id, 95)
+
+    # STEP 6: Save result (95% -> 98%)
+    result_payload = {
+        "summary": summary,
+        "pdf": pdf_url,
+        "csv": csv_url,
+        "top_10": analyzed[:10],
+        "total_analyzed": len(analyzed),
+    }
+
+    await set_job(job_id, result=result_payload)
+    await safe_progress(job_id, 98)
+
+    # STEP 7: Notify user (98% -> 100%)
+    await send_email(order["email"], job_id, pdf_url, csv_url, summary)
+
+    await set_job(job_id, status="completed", completed_at=utcnow_iso())
+    await safe_progress(job_id, 100)
+
+# =========================
+# SCRAPING (STUBBED ASYNC)
+# =========================
+
+async def scrape_google_maps(industry: str, location: str, radius: int) -> List[Dict[str, Any]]:
+    """
+    Replace this with SerpAPI / other provider integration.
+    For now, stub + sleep.
+    """
+    print(f"🔍 Scraping Google Maps: {industry} in {location} (radius {radius}mi)")
+    await asyncio.sleep(0.6)
+
+    # Mock data
+    return [
+        {
+            "name": "ABC Plumbing Services",
+            "website": "https://abcplumbing.com",
+            "place_id": "ChIJabc123",
+            "rating": 4.8,
+            "reviews": 247,
+            "address": "123 Main St, Syracuse, NY",
+            "phone": "(315) 555-0100",
+        },
+        {
+            "name": "Quick Response Plumbing",
+            "website": "https://quickresponse.com",
+            "place_id": "ChIJqrs456",
+            "rating": 4.6,
+            "reviews": 189,
+            "address": "456 Oak Ave, Syracuse, NY",
+            "phone": "(315) 555-0200",
+        },
+        {
+            "name": "Elite Plumbing Co",
+            "website": "https://eliteplumbing.com",
+            "place_id": "ChIJxyz789",
+            "rating": 4.5,
+            "reviews": 156,
+            "address": "789 Elm St, Syracuse, NY",
+            "phone": "(315) 555-0300",
+        },
+        {
+            "name": "Budget Plumbers Inc",
+            "website": None,
+            "place_id": "ChIJdef012",
+            "rating": 3.8,
+            "reviews": 42,
+            "address": "321 Pine Rd, Syracuse, NY",
+            "phone": "(315) 555-0400",
+        },
+        {
+            "name": "FastFix Plumbing",
+            "website": "https://fastfixplumbing.com",
+            "place_id": "ChIJghi345",
+            "rating": 3.6,
+            "reviews": 22,
+            "address": "654 Maple Dr, Syracuse, NY",
+            "phone": "(315) 555-0500",
+        },
+    ]
+
+# =========================
+# BUSINESS ANALYSIS
+# =========================
+
+async def analyze_business(business: Dict[str, Any]) -> Dict[str, Any]:
+    website = business.get("website")
+
+    website_task = analyze_website(website) if website else async_return({})
+    review_task = analyze_reviews(business)
+    marketing_task = analyze_marketing(website) if website else async_return({})
+    email_task = extract_email(website) if website else async_return(None)
+
+    website_analysis, review_intel, marketing, email = await asyncio.gather(
+        website_task, review_task, marketing_task, email_task,
+        return_exceptions=False
+    )
+
+    return {
+        **business,
+        "website_analysis": website_analysis or {},
+        "review_intelligence": review_intel or {},
+        "marketing_visibility": marketing or {},
+        "email": email,
+    }
+
+async def async_return(value):
+    return value
+
+async def analyze_website(url: str) -> Dict[str, Any]:
+    if not url:
+        return {}
+
+    # network safe: retries + timeout + redirects
+    async def fetch_html(u: str) -> Tuple[int, str]:
+        assert HTTP_CLIENT is not None
+        resp = await HTTP_CLIENT.get(u, follow_redirects=True)
+        return resp.status_code, resp.text
+
+    try:
+        status_code, html = await retry_async(fetch_html, url, tries=2, base_delay=0.5)
+        html_l = (html or "").lower()
+
+        return {
+            "exists": True,
+            "status_code": status_code,
+            "ssl": url.startswith("https://"),
+            "mobile_friendly": "viewport" in html_l,
+            "has_contact_form": ("<form" in html_l) or ("contact" in html_l),
+            "has_booking_cta": ("book" in html_l) or ("schedule" in html_l) or ("appointment" in html_l),
+            "has_emergency_cta": ("emergency" in html_l) or ("24/7" in html_l) or ("same day" in html_l),
+            "has_phone": "tel:" in html_l,
+            "cms_detected": detect_cms(html_l),
+        }
+    except Exception as e:
+        return {"exists": False, "error": str(e)}
+
+def detect_cms(html_l: str) -> str:
+    if "wp-content" in html_l or "wordpress" in html_l:
+        return "wordpress"
+    if "wix.com" in html_l:
+        return "wix"
+    if "squarespace" in html_l:
+        return "squarespace"
+    if "shopify" in html_l:
+        return "shopify"
+    return "custom"
+
+async def analyze_reviews(business: Dict[str, Any]) -> Dict[str, Any]:
+    reviews = int(business.get("reviews", 0) or 0)
+    rating = float(business.get("rating", 0) or 0)
+
+    velocity = "high" if reviews > 100 else "moderate" if reviews > 30 else "low"
+
+    reputation_strength = (
+        "strong" if rating >= 4.5 and reviews > 50
+        else "moderate" if rating >= 4.0
+        else "weak"
+    )
+
+    return {
+        "rating": rating,
+        "review_count": reviews,
+        "review_velocity": velocity,
+        "estimated_monthly_reviews": round(reviews / 12, 2) if reviews else 0,
+        "reputation_strength": reputation_strength,
+    }
+
+async def analyze_marketing(url: str) -> Dict[str, Any]:
+    """
+    Strong MVP approach:
+    - Pixel detection (reliable)
+    - "Ads presence" is NOT guaranteed without ad library integrations
+    """
+    if not url:
+        return {}
+
+    try:
+        # Reuse website HTML (if you later want, pass HTML in to avoid double fetch)
+        status_code, html = await analyze_website_fetch_html(url)
+        html_l = html.lower()
+
+        pixels = []
+        if "gtag(" in html_l or "google-analytics.com" in html_l or "googletagmanager.com" in html_l:
+            pixels.append("google_analytics")
+        if "fbq(" in html_l or "connect.facebook.net" in html_l:
+            pixels.append("meta_pixel")
+        if "ttq.track" in html_l or "tiktok" in html_l and "pixel" in html_l:
+            pixels.append("tiktok_pixel")
+        if "snaptr(" in html_l or "sc-static.net" in html_l:
+            pixels.append("snap_pixel")
+        if "googleadservices.com" in html_l or "doubleclick.net" in html_l:
+            pixels.append("google_ads_tag")
+
+        return {
+            "pixels_detected": pixels,
+            # "presence" signals inferred from tags:
+            "google_ads_likely": "google_ads_tag" in pixels,
+            "meta_ads_likely": "meta_pixel" in pixels,
+            "tiktok_ads_likely": "tiktok_pixel" in pixels,
+            "snap_ads_likely": "snap_pixel" in pixels,
+        }
+    except Exception as e:
+        return {"error": str(e), "pixels_detected": []}
+
+async def analyze_website_fetch_html(url: str) -> Tuple[int, str]:
+    async def fetch(u: str) -> Tuple[int, str]:
+        assert HTTP_CLIENT is not None
+        resp = await HTTP_CLIENT.get(u, follow_redirects=True)
+        return resp.status_code, resp.text
+
+    return await retry_async(fetch, url, tries=2, base_delay=0.5)
+
+async def extract_email(url: str) -> Optional[str]:
+    """
+    MVP-only:
+    - domain -> info@domain
+    Upgrade later: crawl /contact, regex emails, validate, etc.
+    """
+    if not url:
+        return None
+    domain = url.replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0]
+    if not domain:
+        return None
+    return f"info@{domain}"
+
+# =========================
+# SCORING ALGORITHM
+# =========================
+
+def calculate_score(business: Dict[str, Any]) -> int:
+    score = 0
+
+    # Reputation (40)
+    rating = float(business.get("rating", 0) or 0)
+    if rating >= 4.7:
+        score += 30
+    elif rating >= 4.5:
+        score += 25
+    elif rating >= 4.0:
+        score += 15
+    elif rating >= 3.5:
+        score += 5
+
+    reviews = int(business.get("reviews", 0) or 0)
+    if reviews >= 200:
+        score += 10
+    elif reviews >= 100:
+        score += 8
+    elif reviews >= 50:
+        score += 5
+    elif reviews >= 20:
+        score += 2
+
+    # Website (25)
+    website = business.get("website_analysis", {}) or {}
+    if website.get("exists"):
+        score += 10
+        if website.get("mobile_friendly"):
+            score += 5
+        if website.get("has_booking_cta"):
+            score += 5
+        if website.get("ssl"):
+            score += 3
+        if website.get("has_emergency_cta"):
+            score += 2
+
+    # Marketing (20) — inferred from pixels
+    marketing = business.get("marketing_visibility", {}) or {}
+    if marketing.get("google_ads_likely"):
+        score += 10
+    if marketing.get("meta_ads_likely"):
+        score += 5
+    if marketing.get("tiktok_ads_likely") or marketing.get("snap_ads_likely"):
+        score += 3
+    if len(marketing.get("pixels_detected", [])) > 0:
+        score += 2
+
+    # Review engagement (15)
+    review_intel = business.get("review_intelligence", {}) or {}
+    velocity = review_intel.get("review_velocity", "low")
+    if velocity == "high":
+        score += 10
+    elif velocity == "moderate":
+        score += 5
+
+    strength = review_intel.get("reputation_strength", "weak")
+    if strength == "strong":
+        score += 5
+    elif strength == "moderate":
+        score += 3
+
+    return min(score, 100)
+
+# =========================
+# MARKET SUMMARY
+# =========================
+
+def generate_market_summary(businesses: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not businesses:
+        return {}
+
+    total = len(businesses)
+    avg_rating = sum(float(b.get("rating", 0) or 0) for b in businesses) / total
+    avg_reviews = sum(int(b.get("reviews", 0) or 0) for b in businesses) / total
+    avg_score = sum(int(b.get("score", 0) or 0) for b in businesses) / total
+
+    weak = [b for b in businesses if b.get("score", 0) < 50]
+    moderate = [b for b in businesses if 50 <= b.get("score", 0) < 70]
+    strong = [b for b in businesses if b.get("score", 0) >= 70]
+
+    opportunities = []
+
+    low_reviews = [b for b in businesses if int(b.get("reviews", 0) or 0) < 30]
+    if total and (len(low_reviews) / total) > 0.3:
+        opportunities.append({
+            "type": "review_gap",
+            "severity": "high",
+            "insight": f"{len(low_reviews)} of {total} competitors have under 30 reviews",
+            "action": "Run a review campaign to pass multiple competitors quickly"
+        })
+
+    no_booking = [b for b in businesses if not (b.get("website_analysis", {}) or {}).get("has_booking_cta")]
+    if total and (len(no_booking) / total) > 0.4:
+        opportunities.append({
+            "type": "feature_gap",
+            "severity": "medium",
+            "insight": f"{len(no_booking)} competitors lack online booking",
+            "action": "Add online booking to win more calls and conversions"
+        })
+
+    return {
+        "total_competitors": total,
+        "average_rating": round(avg_rating, 2),
+        "average_reviews": round(avg_reviews, 0),
+        "average_score": round(avg_score, 1),
+        "distribution": {"weak": len(weak), "moderate": len(moderate), "strong": len(strong)},
+        "top_3": [{"name": b.get("name"), "score": b.get("score"), "rating": b.get("rating"), "reviews": b.get("reviews")} for b in businesses[:3]],
+        "opportunities": opportunities,
+        "market_saturation": "high" if total > 20 else "moderate" if total > 10 else "low"
+    }
+
+# =========================
+# REPORTING + EMAIL (STUBS)
+# =========================
+
+async def generate_reports(job_id: str, businesses: List[Dict[str, Any]], summary: Dict[str, Any]) -> Tuple[str, str]:
+    await asyncio.sleep(0.2)
+    pdf_url = f"https://storage.yoursite.com/reports/{job_id}.pdf"
+    csv_url = f"https://storage.yoursite.com/reports/{job_id}.csv"
+    print(f"📊 Generated reports for job {job_id}")
+    return pdf_url, csv_url
+
+async def send_email(to: str, job_id: str, pdf: str, csv: str, summary: Dict[str, Any]):
+    await asyncio.sleep(0.1)
+    print(f"📧 Email sent to {to} | job {job_id} | PDF {pdf} | CSV {csv} | competitors {summary.get('total_competitors')}")
+
+# =========================
+# STARTUP / SHUTDOWN
+# =========================
+
+@app.on_event("startup")
+async def startup_event():
+    global HTTP_CLIENT
+    HTTP_CLIENT = httpx.AsyncClient(timeout=httpx.Timeout(12.0), headers=DEFAULT_HEADERS)
+    print("🚀 Competitor Intelligence Engine started")
+    print("📍 API docs: /docs")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global HTTP_CLIENT
+    if HTTP_CLIENT:
+        await HTTP_CLIENT.aclose()
+        HTTP_CLIENT = None
