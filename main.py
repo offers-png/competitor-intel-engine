@@ -304,19 +304,34 @@ async def retry_async(fn, *args, tries=3, base_delay=0.6, **kwargs):
 # API ENDPOINTS
 # =========================
 
-@app.post("/start-analysis", response_model=JobStatus)
+@app.post("/start-analysis")
 async def start_analysis(order: OrderRequest):
     job_id = str(uuid.uuid4())
+    created_at = datetime.utcnow().isoformat()
 
-    # Create job in database
-    job_data = db_create_job(job_id, order.dict())
-    
-    # Cache for fast access during processing
-    async with JOBS_LOCK:
-        JOBS_CACHE[job_id] = job_data.copy()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO jobs (job_id, status, created_at, completed_at, progress, order_data, result, error)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (job_id, "queued", created_at, None, 0, json.dumps(order.dict()), None, None)
+    )
+    conn.commit()
+    conn.close()
 
     asyncio.create_task(run_job_safe(job_id))
-    return JobStatus(**job_data)
+
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "created_at": created_at,
+        "completed_at": None,
+        "progress_percent": 0,
+        "result": None,
+        "error": None
+    }
 
 
 @app.get("/jobs/{job_id}", response_model=JobStatus)
