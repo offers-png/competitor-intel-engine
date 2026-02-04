@@ -9,6 +9,7 @@ import re
 import uuid
 import sqlite3
 import json
+import ssl
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
@@ -669,27 +670,49 @@ async def analyze_business(business: Dict[str, Any]) -> Dict[str, Any]:
 async def async_return(value):
     return value
 
-async def get_http_client() -> httpx.AsyncClient:
+async def get_http_client(verify_ssl: bool = True) -> httpx.AsyncClient:
     """Get or create HTTP client - ensures client is available even outside ASGI context."""
     global HTTP_CLIENT
-    if HTTP_CLIENT is None:
-        HTTP_CLIENT = httpx.AsyncClient(timeout=httpx.Timeout(12.0), headers=DEFAULT_HEADERS)
-    return HTTP_CLIENT
+    if verify_ssl:
+        if HTTP_CLIENT is None:
+            HTTP_CLIENT = httpx.AsyncClient(
+                timeout=httpx.Timeout(12.0), 
+                headers=DEFAULT_HEADERS
+            )
+        return HTTP_CLIENT
+    else:
+        # Return a one-off client with SSL verification disabled for fallback
+        return httpx.AsyncClient(
+            timeout=httpx.Timeout(12.0), 
+            headers=DEFAULT_HEADERS,
+            verify=False
+        )
 
 async def analyze_website(url: str) -> Dict[str, Any]:
     if not url:
         return {}
 
-    async def fetch_html(u: str) -> Tuple[int, str]:
-        client = await get_http_client()
-        resp = await client.get(u, follow_redirects=True)
-        return resp.status_code, resp.text
+    async def fetch_html_with_fallback(u: str) -> Tuple[int, str, bool]:
+        """Fetch HTML with SSL fallback. Returns (status_code, html, used_ssl_fallback)"""
+        # First try with SSL verification
+        try:
+            client = await get_http_client(verify_ssl=True)
+            resp = await client.get(u, follow_redirects=True)
+            return resp.status_code, resp.text, False
+        except (ssl.SSLError, httpx.ConnectError) as ssl_err:
+            # SSL error - retry without verification
+            if "SSL" in str(ssl_err) or "ssl" in str(ssl_err) or "certificate" in str(ssl_err).lower():
+                print(f"SSL fallback for {u}: {ssl_err}")
+                async with await get_http_client(verify_ssl=False) as client:
+                    resp = await client.get(u, follow_redirects=True)
+                    return resp.status_code, resp.text, True
+            raise
 
     try:
-        status_code, html = await retry_async(fetch_html, url, tries=2, base_delay=0.5)
+        status_code, html, ssl_fallback = await retry_async(fetch_html_with_fallback, url, tries=2, base_delay=0.5)
         html_l = (html or "").lower()
 
-        return {
+        result = {
             "exists": True,
             "status_code": status_code,
             "ssl": url.startswith("https://"),
@@ -700,6 +723,9 @@ async def analyze_website(url: str) -> Dict[str, Any]:
             "has_phone": "tel:" in html_l,
             "cms_detected": detect_cms(html_l),
         }
+        if ssl_fallback:
+            result["ssl_fallback_used"] = True
+        return result
     except Exception as e:
         return {"exists": False, "error": str(e)}
 
@@ -768,12 +794,22 @@ async def analyze_marketing(url: str) -> Dict[str, Any]:
         return {"error": str(e), "pixels_detected": []}
 
 async def analyze_website_fetch_html(url: str) -> Tuple[int, str]:
-    async def fetch(u: str) -> Tuple[int, str]:
-        client = await get_http_client()
-        resp = await client.get(u, follow_redirects=True)
-        return resp.status_code, resp.text
+    async def fetch_with_fallback(u: str) -> Tuple[int, str]:
+        # First try with SSL verification
+        try:
+            client = await get_http_client(verify_ssl=True)
+            resp = await client.get(u, follow_redirects=True)
+            return resp.status_code, resp.text
+        except (ssl.SSLError, httpx.ConnectError) as ssl_err:
+            # SSL error - retry without verification
+            if "SSL" in str(ssl_err) or "ssl" in str(ssl_err) or "certificate" in str(ssl_err).lower():
+                print(f"SSL fallback for marketing analysis {u}: {ssl_err}")
+                async with await get_http_client(verify_ssl=False) as client:
+                    resp = await client.get(u, follow_redirects=True)
+                    return resp.status_code, resp.text
+            raise
 
-    return await retry_async(fetch, url, tries=2, base_delay=0.5)
+    return await retry_async(fetch_with_fallback, url, tries=2, base_delay=0.5)
 
 async def extract_email(url: str) -> Optional[str]:
     """
