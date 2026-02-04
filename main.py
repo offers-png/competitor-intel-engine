@@ -282,10 +282,20 @@ async def get_job(job_id: str) -> Dict[str, Any]:
 
 async def safe_progress(job_id: str, pct: int, status: Optional[str] = None):
     pct = max(0, min(100, int(pct)))
-    updates: Dict[str, Any] = {"progress_percent": pct}
+    conn = get_db_connection()
+    cursor = conn.cursor()
     if status:
-        updates["status"] = status
-    await set_job(job_id, **updates)
+        cursor.execute(
+            "UPDATE jobs SET progress=?, status=? WHERE job_id=?",
+            (pct, status, job_id)
+        )
+    else:
+        cursor.execute(
+            "UPDATE jobs SET progress=? WHERE job_id=?",
+            (pct, job_id)
+        )
+    conn.commit()
+    conn.close()
 
 async def retry_async(fn, *args, tries=3, base_delay=0.6, **kwargs):
     """Simple retry with exponential backoff."""
@@ -424,13 +434,14 @@ async def run_job_safe(job_id: str):
         try:
             await run_job(job_id)
         except Exception as e:
-            await set_job(
-                job_id,
-                status="failed",
-                error=str(e),
-                completed_at=utcnow_iso(),
-                progress_percent=100
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE jobs SET status=?, error=? WHERE job_id=?",
+                ("failed", str(e), job_id)
             )
+            conn.commit()
+            conn.close()
             print(f"Job {job_id} failed: {e}")
 
 
@@ -497,14 +508,32 @@ async def run_job(job_id: str):
         "total_analyzed": len(analyzed),
     }
 
-    await set_job(job_id, result=result_payload)
-    await safe_progress(job_id, 98)
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE jobs SET result=?, progress=? WHERE job_id=?",
+        (json.dumps(result_payload), 98, job_id)
+    )
+    conn.commit()
+    conn.close()
 
     # STEP 7: Notify user (98% -> 100%)
     await send_email(order["email"], job_id, pdf_url, csv_url, summary)
 
-    await set_job(job_id, status="completed", completed_at=utcnow_iso())
-    await safe_progress(job_id, 100)
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE jobs
+        SET status=?, completed_at=?, progress=?
+        WHERE job_id=?
+        """,
+        ("completed", datetime.utcnow().isoformat(), 100, job_id)
+    )
+    conn.commit()
+    conn.close()
+    
+    print(f"Job {job_id} completed successfully")
 
 # =========================
 # SCRAPING (STUBBED ASYNC)
