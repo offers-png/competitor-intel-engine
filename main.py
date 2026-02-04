@@ -527,12 +527,35 @@ async def run_job(job_id: str):
 
     conn = get_db_connection()
     cursor = conn.cursor()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
     cursor.execute(
-        "UPDATE jobs SET result=?, progress=? WHERE job_id=?",
-        (json.dumps(result_payload), 98, job_id)
+        """
+        UPDATE jobs
+        SET
+            status = ?,
+            completed_at = ?,
+            progress = ?,
+            result = ?,
+            error = ?
+        WHERE job_id = ?
+        """,
+        (
+            "completed",
+            datetime.utcnow().isoformat(),
+            100,
+            json.dumps(result_payload),
+            None,
+            job_id
+        )
     )
+
     conn.commit()
     conn.close()
+
+    print(f"Job {job_id} completed successfully")
+
 
     # STEP 7: Notify user (98% -> 100%)
     await send_email(order["email"], job_id, pdf_url, csv_url, summary)
