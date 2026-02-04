@@ -344,9 +344,26 @@ async def start_analysis(order: OrderRequest):
     }
 
 
-@app.get("/jobs/{job_id}", response_model=JobStatus)
+@app.get("/jobs/{job_id}")
 async def get_job_status(job_id: str):
-    return JobStatus(**(await get_job(job_id)))
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return {
+        "job_id": row[0],
+        "status": row[1],
+        "created_at": row[2],
+        "completed_at": row[3],
+        "progress_percent": row[4],
+        "result": json.loads(row[5]) if row[5] else None,
+        "error": row[6]
+    }
 
 
 @app.get("/jobs/{job_id}/pdf")
