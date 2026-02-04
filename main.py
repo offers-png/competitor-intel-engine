@@ -348,7 +348,10 @@ async def start_analysis(order: OrderRequest):
 async def get_job_status(job_id: str):
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,))
+    cursor.execute("""
+        SELECT job_id, status, created_at, completed_at, progress, result, error 
+        FROM jobs WHERE job_id=?
+    """, (job_id,))
     row = cursor.fetchone()
     conn.close()
 
