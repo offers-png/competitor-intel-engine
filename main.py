@@ -427,6 +427,7 @@ async def list_jobs():
 
 @app.get("/")
 async def root():
+    return FileResponse("static/index.html")
     all_jobs = db_get_all_jobs()
     return {
         "name": "Competitor Intelligence Engine",
