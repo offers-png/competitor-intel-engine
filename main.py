@@ -33,6 +33,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 # =========================
 
 app = FastAPI(title="Competitor Intelligence Engine", version="1.2.0")
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 app.add_middleware(
     CORSMiddleware,
