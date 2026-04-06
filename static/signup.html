@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sign Up — Competitor Intelligence Engine</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+</head>
+<body>
+    <header class="header">
+        <div class="container">
+            <a href="/" class="logo">Competitor Intel</a>
+            <nav>
+                <a href="/login">Login</a>
+                <a href="/signup" class="nav-btn">Sign Up</a>
+            </nav>
+        </div>
+    </header>
+
+    <section class="auth-section">
+        <div class="container">
+            <div class="auth-card">
+                <h2>Create your account</h2>
+                <p class="auth-subtitle">Start your 3-day free trial today.</p>
+                <form id="signup-form" class="auth-form">
+                    <div class="form-group">
+                        <label for="email">Email</label>
+                        <input type="email" id="email" name="email" placeholder="you@example.com" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="password">Password</label>
+                        <input type="password" id="password" name="password" placeholder="At least 8 characters" minlength="8" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="password_confirm">Confirm Password</label>
+                        <input type="password" id="password_confirm" name="password_confirm" placeholder="Confirm your password" minlength="8" required>
+                    </div>
+                    <div id="error-message" class="auth-error" style="display: none;"></div>
+                    <button type="submit" class="cta-btn">Sign Up</button>
+                </form>
+                <p class="auth-switch">Already have an account? <a href="/login">Login</a></p>
+            </div>
+        </div>
+    </section>
+
+    <footer class="footer">
+        <div class="container">
+            <p>&copy; 2026 Competitor Intelligence Engine. All rights reserved.</p>
+        </div>
+    </footer>
+
+    <script>
+    document.getElementById('signup-form').addEventListener('submit', async function(e) {
+        e.preventDefault();
+        const errorEl = document.getElementById('error-message');
+        errorEl.style.display = 'none';
+
+        const email = document.getElementById('email').value;
+        const password = document.getElementById('password').value;
+        const passwordConfirm = document.getElementById('password_confirm').value;
+
+        if (password !== passwordConfirm) {
+            errorEl.textContent = 'Passwords do not match.';
+            errorEl.style.display = 'block';
+            return;
+        }
+
+        try {
+            const response = await fetch('/signup', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email, password })
+            });
+
+            if (response.redirected) {
+                window.location.href = response.url;
+                return;
+            }
+
+            const data = await response.json();
+
+            if (!response.ok) {
+                errorEl.textContent = data.detail || 'Signup failed. Please try again.';
+                errorEl.style.display = 'block';
+                return;
+            }
+
+            if (data.checkout_url) {
+                window.location.href = data.checkout_url;
+            }
+        } catch (err) {
+            errorEl.textContent = 'Something went wrong. Please try again.';
+            errorEl.style.display = 'block';
+        }
+    });
+    </script>
+</body>
+</html>

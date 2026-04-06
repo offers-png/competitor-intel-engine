@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard — Competitor Intelligence Engine</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+</head>
+<body>
+    <header class="header">
+        <div class="container">
+            <a href="/dashboard" class="logo">Competitor Intel</a>
+            <nav>
+                <span id="user-email" class="nav-user"></span>
+                <button id="logout-btn" class="nav-btn logout-btn">Logout</button>
+            </nav>
+        </div>
+    </header>
+
+    <section class="dashboard-section">
+        <div class="container">
+            <div id="inactive-banner" class="inactive-banner" style="display: none;">
+                <div class="inactive-icon">⏳</div>
+                <h3>Subscription required to run analysis</h3>
+                <p>Complete your payment to start running competitor analyses.</p>
+                <a href="/signup" class="cta-btn">Subscribe Now</a>
+            </div>
+
+            <div id="active-content" style="display: none;">
+                <h2>Run a Competitor Analysis</h2>
+                <form id="analysis-form" class="analysis-form">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="business_name">Your Business Name</label>
+                            <input type="text" id="business_name" name="business_name" placeholder="My Plumbing Co" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="industry">Industry</label>
+                            <input type="text" id="industry" name="industry" placeholder="plumber, electrician, dentist..." required>
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="location">City or ZIP Code</label>
+                            <input type="text" id="location" name="location" placeholder="New York, NY" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="radius_miles">Radius (miles)</label>
+                            <input type="number" id="radius_miles" name="radius_miles" value="10" min="1" max="100">
+                        </div>
+                    </div>
+                    <button type="submit" class="cta-btn">Run Competitor Analysis</button>
+                </form>
+
+                <div id="result" class="result-container" style="display: none;">
+                    <div class="loading">
+                        <div class="spinner"></div>
+                        <p>Analyzing competitors... <span id="progress">0</span>%</p>
+                    </div>
+                    <div class="result-content" style="display: none;"></div>
+                </div>
+
+                <div class="job-history-section">
+                    <h2>Your Analysis History</h2>
+                    <div id="job-history" class="job-history">
+                        <p class="empty-state">No analyses yet. Run your first one above!</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <footer class="footer">
+        <div class="container">
+            <p>&copy; 2026 Competitor Intelligence Engine. All rights reserved.</p>
+        </div>
+    </footer>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', async function() {
+        const userEmailEl = document.getElementById('user-email');
+        const inactiveBanner = document.getElementById('inactive-banner');
+        const activeContent = document.getElementById('active-content');
+
+        try {
+            const res = await fetch('/me');
+            if (!res.ok) {
+                window.location.href = '/login';
+                return;
+            }
+            const user = await res.json();
+            userEmailEl.textContent = user.email;
+
+            if (user.active) {
+                activeContent.style.display = 'block';
+                loadJobHistory();
+            } else {
+                inactiveBanner.style.display = 'block';
+            }
+        } catch (err) {
+            window.location.href = '/login';
+            return;
+        }
+
+        document.getElementById('logout-btn').addEventListener('click', async function() {
+            await fetch('/logout', { method: 'POST' });
+            window.location.href = '/';
+        });
+
+        const form = document.getElementById('analysis-form');
+        const resultContainer = document.getElementById('result');
+        const loadingDiv = resultContainer.querySelector('.loading');
+        const resultContent = resultContainer.querySelector('.result-content');
+        const progressSpan = document.getElementById('progress');
+
+        form.addEventListener('submit', async function(e) {
+            e.preventDefault();
+
+            const userRes = await fetch('/me');
+            const user = await userRes.json();
+
+            const formData = {
+                email: user.email,
+                business_name: document.getElementById('business_name').value,
+                industry: document.getElementById('industry').value,
+                location: document.getElementById('location').value,
+                radius_miles: parseInt(document.getElementById('radius_miles').value) || 10
+            };
+
+            resultContainer.style.display = 'block';
+            loadingDiv.style.display = 'block';
+            loadingDiv.innerHTML = '<div class="spinner"></div><p>Analyzing competitors... <span id="progress">0</span>%</p>';
+            resultContent.style.display = 'none';
+            const newProgressSpan = document.getElementById('progress');
+
+            try {
+                const startResponse = await fetch('/start-analysis', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(formData)
+                });
+
+                if (!startResponse.ok) {
+                    const error = await startResponse.json();
+                    throw new Error(error.detail || 'Failed to start analysis');
+                }
+
+                const job = await startResponse.json();
+                const jobId = job.job_id;
+
+                let completed = false;
+                while (!completed) {
+                    await new Promise(resolve => setTimeout(resolve, 1500));
+
+                    const statusResponse = await fetch(`/jobs/${jobId}`);
+                    const status = await statusResponse.json();
+
+                    const pSpan = document.getElementById('progress');
+                    if (pSpan) pSpan.textContent = status.progress_percent || 0;
+
+                    if (status.status === 'completed') {
+                        completed = true;
+                        displayResults(jobId, status.result);
+                        loadJobHistory();
+                    } else if (status.status === 'failed') {
+                        throw new Error(status.error || 'Analysis failed');
+                    }
+                }
+            } catch (error) {
+                loadingDiv.innerHTML = `<p style="color: #dc2626;">Error: ${error.message}</p>`;
+            }
+        });
+
+        function displayResults(jobId, result) {
+            loadingDiv.style.display = 'none';
+            resultContent.style.display = 'block';
+
+            const summary = result.summary || {};
+            const top10 = result.top_10 || [];
+            const opportunities = summary.opportunities || [];
+
+            let opportunitiesHtml = '';
+            if (opportunities.length > 0) {
+                opportunitiesHtml = `
+                    <div class="opportunities" style="margin-bottom: 24px;">
+                        <h4 style="margin-bottom: 12px; color: #1e3a5f;">Key Opportunities</h4>
+                        ${opportunities.map(opp => `
+                            <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 12px; margin-bottom: 8px;">
+                                <strong style="color: #166534;">${(opp.type || '').replace(/_/g, ' ')}</strong>
+                                <p style="margin: 4px 0; color: #166534;">${opp.insight}</p>
+                                <p style="margin: 0; font-size: 0.9rem; color: #15803d;"><em>Action: ${opp.action}</em></p>
+                            </div>
+                        `).join('')}
+                    </div>
+                `;
+            }
+
+            resultContent.innerHTML = `
+                <h3>Analysis Complete!</h3>
+                <div class="result-summary">
+                    <div class="stat-card">
+                        <div class="stat-value">${summary.total_competitors || 0}</div>
+                        <div class="stat-label">Competitors</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value">${(summary.average_rating || 0).toFixed(1)}</div>
+                        <div class="stat-label">Avg Rating</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value">${Math.round(summary.average_reviews || 0)}</div>
+                        <div class="stat-label">Avg Reviews</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value">${(summary.market_saturation || 'N/A').charAt(0).toUpperCase() + (summary.market_saturation || 'N/A').slice(1)}</div>
+                        <div class="stat-label">Saturation</div>
+                    </div>
+                </div>
+                ${opportunitiesHtml}
+                <h4 style="margin-bottom: 12px; color: #1e3a5f;">Top Competitors</h4>
+                <table class="competitors-table">
+                    <thead>
+                        <tr>
+                            <th>#</th>
+                            <th>Business</th>
+                            <th>Score</th>
+                            <th>Rating</th>
+                            <th>Reviews</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${top10.slice(0, 5).map((b, i) => `
+                            <tr>
+                                <td>${i + 1}</td>
+                                <td>${b.name || 'Unknown'}</td>
+                                <td><strong>${b.score || 0}</strong></td>
+                                <td>${(b.rating || 0).toFixed(1)}</td>
+                                <td>${b.reviews || 0}</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+                <div class="download-btns">
+                    <a href="/jobs/${jobId}/pdf" class="download-btn" download>
+                        📄 Download PDF Report
+                    </a>
+                    <a href="/jobs/${jobId}/csv" class="download-btn secondary" download>
+                        📊 Download CSV Data
+                    </a>
+                </div>
+            `;
+        }
+
+        async function loadJobHistory() {
+            const historyContainer = document.getElementById('job-history');
+            try {
+                const res = await fetch('/jobs');
+                if (!res.ok) return;
+                const jobs = await res.json();
+
+                if (!jobs.length) {
+                    historyContainer.innerHTML = '<p class="empty-state">No analyses yet. Run your first one above!</p>';
+                    return;
+                }
+
+                historyContainer.innerHTML = `
+                    <table class="competitors-table">
+                        <thead>
+                            <tr>
+                                <th>Date</th>
+                                <th>Industry</th>
+                                <th>Location</th>
+                                <th>Status</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${jobs.map(job => `
+                                <tr>
+                                    <td>${new Date(job.created_at || job.started_at || '').toLocaleDateString()}</td>
+                                    <td>${job.industry || '-'}</td>
+                                    <td>${job.location || '-'}</td>
+                                    <td><span class="status-badge status-${job.status}">${job.status}</span></td>
+                                    <td>
+                                        ${job.status === 'completed' ? `
+                                            <a href="/jobs/${job.job_id}/pdf" class="action-link" download>PDF</a>
+                                            <a href="/jobs/${job.job_id}/csv" class="action-link" download>CSV</a>
+                                        ` : '-'}
+                                    </td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                `;
+            } catch (err) {
+                historyContainer.innerHTML = '<p class="empty-state">Could not load history.</p>';
+            }
+        }
+    });
+    </script>
+</body>
+</html>

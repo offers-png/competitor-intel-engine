@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login — Competitor Intelligence Engine</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+</head>
+<body>
+    <header class="header">
+        <div class="container">
+            <a href="/" class="logo">Competitor Intel</a>
+            <nav>
+                <a href="/login" class="nav-btn">Login</a>
+                <a href="/signup">Sign Up</a>
+            </nav>
+        </div>
+    </header>
+
+    <section class="auth-section">
+        <div class="container">
+            <div class="auth-card">
+                <h2>Welcome back</h2>
+                <p class="auth-subtitle">Log in to access your dashboard.</p>
+                <form id="login-form" class="auth-form">
+                    <div class="form-group">
+                        <label for="email">Email</label>
+                        <input type="email" id="email" name="email" placeholder="you@example.com" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="password">Password</label>
+                        <input type="password" id="password" name="password" placeholder="Your password" required>
+                    </div>
+                    <div id="error-message" class="auth-error" style="display: none;"></div>
+                    <button type="submit" class="cta-btn">Login</button>
+                </form>
+                <p class="auth-switch">Don't have an account? <a href="/signup">Sign Up</a></p>
+            </div>
+        </div>
+    </section>
+
+    <footer class="footer">
+        <div class="container">
+            <p>&copy; 2026 Competitor Intelligence Engine. All rights reserved.</p>
+        </div>
+    </footer>
+
+    <script>
+    document.getElementById('login-form').addEventListener('submit', async function(e) {
+        e.preventDefault();
+        const errorEl = document.getElementById('error-message');
+        errorEl.style.display = 'none';
+
+        const email = document.getElementById('email').value;
+        const password = document.getElementById('password').value;
+
+        try {
+            const response = await fetch('/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email, password })
+            });
+
+            if (response.redirected) {
+                window.location.href = response.url;
+                return;
+            }
+
+            const data = await response.json();
+
+            if (!response.ok) {
+                errorEl.textContent = data.detail || 'Invalid email or password.';
+                errorEl.style.display = 'block';
+                return;
+            }
+
+            if (data.redirect) {
+                window.location.href = data.redirect;
+            }
+        } catch (err) {
+            errorEl.textContent = 'Something went wrong. Please try again.';
+            errorEl.style.display = 'block';
+        }
+    });
+    </script>
+</body>
+</html>
