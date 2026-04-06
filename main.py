@@ -429,6 +429,19 @@ async def list_jobs():
 @app.get("/")
 async def root():
     return FileResponse("static/index.html")
+
+@app.get("/login")
+async def login_page():
+    return FileResponse("static/login.html")
+
+@app.get("/signup")
+async def signup_page():
+    return FileResponse("static/signup.html")
+
+@app.get("/dashboard")
+async def dashboard_page():
+    return FileResponse("static/dashboard.html")
+    
     all_jobs = db_get_all_jobs()
     return {
         "name": "Competitor Intelligence Engine",
