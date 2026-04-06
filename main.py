@@ -1,4 +1,6 @@
 # main.py
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 # Competitor Intelligence Engine - Strong Single-File MVP (Replit-ready)
 
 import asyncio
